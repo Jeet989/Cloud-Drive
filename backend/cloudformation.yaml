@@ -49,7 +49,7 @@ Resources:
           yum install -y git
           yum install -y nodejs
           cd /home/ec2-user
-          git clone https://jeet:------@git.cs.dal.ca/courses/2023-summer/csci4145-5409/jeet.git
+          git clone repo url
           cd /home/ec2-user/jeet/termassignment/backend/
           npm install pm2@latest -g
           pm2 -v
