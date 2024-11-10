@@ -1,0 +1,525 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: CloudFomation for cloudtermproject
+
+Parameters:
+  BucketName:
+    Type: String
+    Default: cloud-drive-term-project
+
+Resources:
+  MyS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+  MyS3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref MyS3Bucket
+      PolicyDocument:
+        Statement:
+          - Action:
+              - s3:DeleteObject
+              - s3:GetObject
+              - s3:PutObject
+            Effect: Allow
+            Resource: !Sub arn:aws:s3:::${MyS3Bucket}/*
+            Principal: "*"
+
+  MyEC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: ami-0f34c5ae932e6f0e4
+      InstanceType: t2.micro
+      KeyName: cloudtermproject
+      SecurityGroups:
+        - Ref: MySecurityGroup
+      Tags:
+        - Key: Name
+          Value: cloud-term-instance
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          sudo su
+          yum update -y
+          yum install -y git
+          yum install -y nodejs
+          cd /home/ec2-user
+          git clone https://jeet:------@git.cs.dal.ca/courses/2023-summer/csci4145-5409/jeet.git
+          cd /home/ec2-user/jeet/termassignment/backend/
+          npm install pm2@latest -g
+          pm2 -v
+          npm install
+          pm2 start index.js
+
+  MySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH traffic
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          CidrIp: 0.0.0.0/0
+
+  # add MyEC2Instance Public IP Address to secrets manager
+  MyEC2InstancePublicIPSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: /cloudy/ec2-instance-public-ip
+      Description: Public IP address of the EC2 instance
+      SecretString: !GetAtt MyEC2Instance.PublicIp
+
+  # create an sns topic
+  MySNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: object-upload-success
+      DisplayName: Object Upload Successful To S3
+
+  # send subscription email to the user
+  MyLambdaSubscriptionFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: send-subscription-notification-function
+      Runtime: nodejs14.x
+      Handler: index.handler
+      Role: !GetAtt SubcribeLambdaRole.Arn
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+
+          exports.handler = async (event, context) => {
+
+            // Initialize the AWS SDK
+            AWS.config.update({ region: '------' });
+            const sns = new AWS.SNS();
+
+            try {
+              // Publish the message to the SNS topic
+              const user = JSON.parse(event.body)
+              const params1 = {
+                Protocol: 'EMAIL', /* required */
+                TopicArn: process.env.SNSTopicARN, /* required */
+                Endpoint: user.user
+              }
+                  
+                var subscribePromise = await new AWS.SNS({apiVersion: '2010-03-31'}).subscribe(params1).promise();
+                
+                console.log('subscribePromise ==>', subscribePromise)
+
+              return {
+                statusCode: 200,
+                body: JSON.stringify('Email notification sent successfully!'),
+              };
+            } catch (error) {
+              console.log('error sending email notificaiton ==>', error)
+              return {
+                statusCode: 500,
+                body: JSON.stringify(`Error sending email notification: ${error.message}`),
+              };
+            }
+          };
+      Environment:
+        Variables:
+          SNSTopicARN: !Ref MySNSTopic
+  SubcribeLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: SubcribeLambdaRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Path: /
+      Policies:
+        - PolicyName: LambdaBasicExecutionPolicy-Subcribe
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "*"
+        - PolicyName: SNSSubscribePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Subscribe
+                Resource: "*"
+
+  # publish the message to the user enrolled in the topic
+  MyLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: send-notification-function
+      Runtime: nodejs14.x
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+
+          exports.handler = async (event, context) => {
+
+            // Initialize the AWS SDK
+            AWS.config.update({ region: '-------' });
+            const sns = new AWS.SNS();
+
+            try {
+              // Publish the message to the SNS topic
+              const params = {
+                Message: 'Your File has been successfully uploaded to the server!',
+                Subject: 'Successfully uploaded a file to your S3 bucket!',
+                TopicArn: process.env.SNSTopicARN,
+              };
+
+              await sns.publish(params).promise();
+
+              return {
+                statusCode: 200,
+                body: JSON.stringify('Email notification sent successfully!'),
+              };
+            } catch (error) {
+              console.log('error sending email notificaiton ==>', error)
+              return {
+                statusCode: 500,
+                body: JSON.stringify(`Error sending email notification: ${error.message}`),
+              };
+            }
+          };
+      Environment:
+        Variables:
+          SNSTopicARN: !Ref MySNSTopic
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: LambdaRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Path: /
+      Policies:
+        - PolicyName: LambdaBasicExecutionPolicy-Publish
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "*"
+        - PolicyName: SNSPublishPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: "*"
+
+  # send unsubscription email to the user
+  MyLambdaUnSubscriptionFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: send-un-subscription-notification-function
+      Runtime: nodejs14.x
+      Handler: index.handler
+      Role: !GetAtt UnSubcribeLambdaRole.Arn
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+
+          exports.handler = async (event, context) => {
+
+            // Initialize the AWS SDK
+            AWS.config.update({ region: '-----' });
+            const sns = new AWS.SNS();
+
+            try {
+              // Publish the message to the SNS topic
+              const params = {
+                SubscriptionArn: process.env.SNSTopicARN /* required */
+              };
+              
+              await sns.unsubscribe(params, function(err, data) {
+                if (err) console.log(err, err.stack); // an error occurred
+                else     console.log(data);           // successful response
+              });
+
+              return {
+                statusCode: 200,
+                body: JSON.stringify('Email unsubscribe notification sent successfully!'),
+              };
+            } catch (error) {
+              console.log('error sending email unsubscribe notificaiton ==>', error)
+              return {
+                statusCode: 500,
+                body: JSON.stringify(`Error sending email unsubscribe notification: ${error.message}`),
+              };
+            }
+          };
+      Environment:
+        Variables:
+          SNSTopicARN: !Ref MySNSTopic
+  UnSubcribeLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: UnSubcribeLambdaRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Path: /
+      Policies:
+        - PolicyName: LambdaBasicExecutionPolicy-UnSubcribe
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "*"
+        - PolicyName: SNSSubscribePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Unsubscribe
+                Resource: "*"
+
+  # create API gateway
+  CloudyAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: CloudyAPI
+      Description: API for Cloudy
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Tags:
+        - Key: Name
+          Value: CloudyAPI
+  # create API gateway resource
+  CloudyAPIResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CloudyAPI
+      ParentId: !GetAtt CloudyAPI.RootResourceId
+      PathPart: subscribe
+
+  #create API gateway resource for notify
+  CloudyAPIResourceNotify:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CloudyAPI
+      ParentId: !GetAtt CloudyAPI.RootResourceId
+      PathPart: notify
+
+  # create API gateway resource for unsubscribe
+  CloudyAPIResourceUnSubscribe:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CloudyAPI
+      ParentId: !GetAtt CloudyAPI.RootResourceId
+      PathPart: unsubscribe
+
+  # create API gateway method
+  CloudyAPIMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CloudyAPI
+      ResourceId: !Ref CloudyAPIResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MyLambdaSubscriptionFunction.Arn}/invocations
+
+  # create API gateway method for notify
+  CloudyAPIMethodNotify:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CloudyAPI
+      ResourceId: !Ref CloudyAPIResourceNotify
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MyLambdaFunction.Arn}/invocations
+
+  # create API gateway method for unsubscribe
+  CloudyAPIMethodUnSubscribe:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CloudyAPI
+      ResourceId: !Ref CloudyAPIResourceUnSubscribe
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MyLambdaUnSubscriptionFunction.Arn}/invocations
+
+  # create API gateway lambda permission
+  CloudyAPILambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt MyLambdaSubscriptionFunction.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${CloudyAPI}/*/POST/subscribe
+
+  # create API gateway lambda permission for notify
+  CloudyAPILambdaPermissionNotify:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt MyLambdaFunction.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${CloudyAPI}/*/POST/notify
+
+  # create API gateway lambda permission for unsubscribe
+  CloudyAPILambdaPermissionUnSubscribe:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt MyLambdaUnSubscriptionFunction.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${CloudyAPI}/*/POST/unsubscribe
+
+  # create API gateway deployment
+  CloudyAPIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - CloudyAPIMethod
+    Properties:
+      RestApiId: !Ref CloudyAPI
+      StageName: prod
+
+  # store this API Gateway URL in a secrets manager for later use
+  CloudyAPISendNotsSecretsParameter:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: /cloudy/sendNotification
+      Description: API Gateway URL for sending notification
+      SecretString: !Sub https://${CloudyAPI}.execute-api.${AWS::Region}.amazonaws.com/prod/notify
+
+  # store this API Gateway URL in a secrets manager for later use
+  CloudyAPISubscribeSecretsParameter:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: /cloudy/subscribe
+      Description: API Gateway URL for subscribing
+      SecretString: !Sub https://${CloudyAPI}.execute-api.${AWS::Region}.amazonaws.com/prod/subscribe
+
+  # store this API Gateway URL in a secrets manager for later use
+  CloudyAPIUnSubscribeSecretsParameter:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: /cloudy/unsubscribe
+      Description: API Gateway URL for unsubscribing
+      SecretString: !Sub https://${CloudyAPI}.execute-api.${AWS::Region}.amazonaws.com/prod/unsubscribe
+
+  MyDynamoDB:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: users
+      AttributeDefinitions:
+        - AttributeName: email
+          AttributeType: S
+      KeySchema:
+        - AttributeName: email
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+
+  MyDynamoDBBackupVault:
+    Type: AWS::Backup::BackupVault
+    Properties:
+      BackupVaultName: cloud-term-vault-backup-2323
+
+  MyDynamoDBBackupPlan:
+    Type: AWS::Backup::BackupPlan
+    Properties:
+      BackupPlan:
+        BackupPlanName: cloud-term-998-backup-plan
+        BackupPlanRule:
+          - RuleName: backup-rule
+            TargetBackupVault: !Ref MyDynamoDBBackupVault
+            ScheduleExpression: cron(59 20 * * ? *)
+            StartWindowMinutes: 60
+            Lifecycle:
+              DeleteAfterDays: 30
+
+  MyDynamoDBBackupSelection:
+    Type: AWS::Backup::BackupSelection
+    Properties:
+      BackupPlanId: !Ref MyDynamoDBBackupPlan
+      BackupSelection:
+        SelectionName: backup-selection
+        IamRoleArn: !GetAtt MyDynamoDBBackupRole.Arn
+        Resources:
+          - !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/users
+
+  MyDynamoDBBackupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - backup.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Path: /
+      Policies:
+        - PolicyName: MyDynamoDBBackupRolePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:*
+                Resource: "*"
+Outputs:
+  SNSTopicARN:
+    Value: !Ref MySNSTopic
+    Description: ARN of the created SNS topic
